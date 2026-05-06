@@ -304,39 +304,331 @@ Deploy workflow (.github/workflows/deploy.yml):
 
 ### 14.3 Create AWS OIDC role for GitHub Actions
 
-In your AWS account:
-1. Create IAM OIDC identity provider for token.actions.githubusercontent.com (if not already present).
-2. Create an IAM role trusted by GitHub OIDC for your repository.
-3. Allow sts:AssumeRoleWithWebIdentity from your repo/branch conditions.
+GitHub Actions uses OpenID Connect (OIDC) to securely assume an AWS role without storing credentials.
 
-Minimum role capabilities for this lab:
-1. ECR push and pull permissions.
-2. Terraform target resources (DynamoDB, SNS, SQS, IAM-related actions used by your tf code).
+#### 14.3.1 Create OIDC identity provider (one-time per AWS account)
+
+**Option A: AWS Console**
+
+1. Go to AWS Console → IAM → Identity providers
+2. Click "Add provider"
+3. Select "OpenID Connect"
+4. Provider URL: `https://token.actions.githubusercontent.com`
+5. Audience: `sts.amazonaws.com`
+6. Click "Add provider"
+7. Verify provider now shows in list
+
+**Option B: AWS CLI**
+
+```bash
+aws iam create-open-id-connect-provider \
+  --url https://token.actions.githubusercontent.com \
+  --client-id-list sts.amazonaws.com \
+  --thumbprint-list 6938fd4d98bab03faadb97b34396831e3780aea1
+```
+
+#### 14.3.2 Create IAM role for GitHub Actions
+
+**Option A: AWS Console**
+
+1. Go to IAM → Roles → Create role
+2. Select trusted entity type: "Web identity"
+3. Identity provider: Select `token.actions.githubusercontent.com`
+4. Audience: `sts.amazonaws.com`
+5. Click "Next"
+6. Permissions: Skip for now (we'll add inline policy)
+7. Role name: `github-actions-nestjs-aws-lab`
+8. Click "Create role"
+
+**Option B: AWS CLI**
+
+First, create trust policy file `trust-policy.json`:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Principal": {
+        "Federated": "arn:aws:iam::<YOUR-AWS-ACCOUNT-ID>:oidc-provider/token.actions.githubusercontent.com"
+      },
+      "Action": "sts:AssumeRoleWithWebIdentity",
+      "Condition": {
+        "StringEquals": {
+          "token.actions.githubusercontent.com:aud": "sts.amazonaws.com"
+        },
+        "StringLike": {
+          "token.actions.githubusercontent.com:sub": "repo:rujenamatya/nestjs-aws-event-lab:ref:refs/heads/main"
+        }
+      }
+    }
+  ]
+}
+```
+
+Replace `<YOUR-AWS-ACCOUNT-ID>` with your AWS account ID (from `aws sts get-caller-identity`).
+
+Then create the role:
+
+```bash
+aws iam create-role \
+  --role-name github-actions-nestjs-aws-lab \
+  --assume-role-policy-document file://trust-policy.json
+```
+
+#### 14.3.3 Attach permissions to the role
+
+Create policy file `role-policy.json`:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "ECRPermissions",
+      "Effect": "Allow",
+      "Action": [
+        "ecr:GetAuthorizationToken",
+        "ecr:BatchCheckLayerAvailability",
+        "ecr:GetDownloadUrlForLayer",
+        "ecr:PutImage",
+        "ecr:InitiateLayerUpload",
+        "ecr:UploadLayerPart",
+        "ecr:CompleteLayerUpload"
+      ],
+      "Resource": "arn:aws:ecr:us-east-1:<YOUR-AWS-ACCOUNT-ID>:repository/hello-events-api"
+    },
+    {
+      "Sid": "TerraformDynamoDBPermissions",
+      "Effect": "Allow",
+      "Action": [
+        "dynamodb:CreateTable",
+        "dynamodb:DescribeTable",
+        "dynamodb:DeleteTable",
+        "dynamodb:UpdateTable",
+        "dynamodb:ListTables"
+      ],
+      "Resource": "arn:aws:dynamodb:us-east-1:<YOUR-AWS-ACCOUNT-ID>:table/hello-events"
+    },
+    {
+      "Sid": "TerraformSNSPermissions",
+      "Effect": "Allow",
+      "Action": [
+        "sns:CreateTopic",
+        "sns:DeleteTopic",
+        "sns:GetTopicAttributes",
+        "sns:SetTopicAttributes",
+        "sns:ListTopics",
+        "sns:Subscribe",
+        "sns:Unsubscribe",
+        "sns:ListSubscriptionsByTopic"
+      ],
+      "Resource": "arn:aws:sns:us-east-1:<YOUR-AWS-ACCOUNT-ID>:hello-events-created*"
+    },
+    {
+      "Sid": "TerraformSQSPermissions",
+      "Effect": "Allow",
+      "Action": [
+        "sqs:CreateQueue",
+        "sqs:DeleteQueue",
+        "sqs:GetQueueAttributes",
+        "sqs:SetQueueAttributes",
+        "sqs:ListQueues",
+        "sqs:PurgeQueue"
+      ],
+      "Resource": "arn:aws:sqs:us-east-1:<YOUR-AWS-ACCOUNT-ID>:hello-events-created-queue*"
+    },
+    {
+      "Sid": "TerraformIAMPermissions",
+      "Effect": "Allow",
+      "Action": [
+        "iam:CreateRole",
+        "iam:DeleteRole",
+        "iam:GetRole",
+        "iam:UpdateRole",
+        "iam:AttachRolePolicy",
+        "iam:DetachRolePolicy",
+        "iam:PutRolePolicy",
+        "iam:DeleteRolePolicy",
+        "iam:ListRolePolicies",
+        "iam:CreateInstanceProfile",
+        "iam:DeleteInstanceProfile",
+        "iam:AddRoleToInstanceProfile",
+        "iam:RemoveRoleFromInstanceProfile"
+      ],
+      "Resource": "arn:aws:iam::<YOUR-AWS-ACCOUNT-ID>:role/*",
+      "Condition": {
+        "StringLike": {
+          "aws:RequestedRegion": "us-east-1"
+        }
+      }
+    }
+  ]
+}
+```
+
+Replace `<YOUR-AWS-ACCOUNT-ID>` with your AWS account ID.
+
+**Option A: AWS Console**
+
+1. Go to IAM → Roles → Select `github-actions-nestjs-aws-lab`
+2. Click "Add permissions" → "Create inline policy"
+3. Copy the JSON from `role-policy.json` above into the policy editor
+4. Review and create
+
+**Option B: AWS CLI**
+
+```bash
+aws iam put-role-policy \
+  --role-name github-actions-nestjs-aws-lab \
+  --policy-name github-actions-nestjs-aws-lab-policy \
+  --policy-document file://role-policy.json
+```
+
+#### 14.3.4 Get the role ARN
+
+```bash
+aws iam get-role --role-name github-actions-nestjs-aws-lab
+```
+
+Look for `Arn` in the output. Example:
+```
+arn:aws:iam::123456789012:role/github-actions-nestjs-aws-lab
+```
+
+Save this ARN—you'll use it as `AWS_ROLE_TO_ASSUME` secret in GitHub.
+
+#### 14.3.5 Verify role is correctly configured
+
+Test the OIDC trust:
+
+1. Go to IAM → Roles → `github-actions-nestjs-aws-lab`
+2. Click "Trust relationships" tab
+3. Confirm principal is `arn:aws:iam::<ACCOUNT-ID>:oidc-provider/token.actions.githubusercontent.com`
+4. Confirm condition restricts to your repo and main branch
+
+Example condition:
+```json
+"token.actions.githubusercontent.com:sub": "repo:rujenamatya/nestjs-aws-event-lab:ref:refs/heads/main"
+```
 3. Optional: least privilege scoped to lab resources.
 
 ### 14.4 Prepare EC2 host for runtime deployment
 
-Your deploy workflow SSHes into EC2 and runs docker commands. Ensure EC2 has:
-1. Docker installed and running.
-2. AWS CLI installed.
-3. Permission to pull from ECR (instance profile or aws configure on the host).
-4. Runtime env file present at /opt/hello-events/.env.
+#### 14.4.1 Launch EC2 instance
 
-Create host env file:
+1. Go to AWS Console → EC2 → Launch instances
+2. Choose Amazon Linux 2 AMI
+3. Instance type: t3.small (eligible for free tier if new account)
+4. Advanced details → IAM instance profile: Select the profile created in 14.4.2
+5. Security group (new): Allow:
+   - SSH (TCP 22) from your IP
+   - TCP 3000 from 0.0.0.0/0 (for API)
+6. Storage: 20 GB gp3 (default)
+7. Launch and save the .pem key file locally
+
+Record the public IP or DNS after launch.
+
+#### 14.4.2 Create IAM instance profile for ECR access
+
+EC2 needs permission to pull Docker images from ECR.
+
+Create a role `hello-events-ec2-role`:
+- Trust: EC2 service
+- Permission: `AmazonEC2ContainerRegistryPowerUser`
+
+Then create instance profile:
 
 ```bash
+aws iam create-instance-profile --instance-profile-name hello-events-ec2-profile
+aws iam add-role-to-instance-profile \
+  --instance-profile-name hello-events-ec2-profile \
+  --role-name hello-events-ec2-role
+```
+
+(Do this before launching EC2 in 14.4.1, or attach profile after launch)
+
+#### 14.4.3 SSH into EC2 and install Docker + AWS CLI
+
+```bash
+# From your machine
+chmod 600 /path/to/key.pem
+ssh -i /path/to/key.pem ec2-user@<EC2_PUBLIC_IP>
+
+# Once logged in
+sudo yum update -y
+sudo yum install docker aws-cli -y
+sudo systemctl start docker
+sudo systemctl enable docker
+
+# Verify
+docker ps
+aws --version
+```
+
+#### 14.4.4 Create runtime environment directory and .env file
+
+Get outputs from local machine first:
+
+```bash
+cd terraform
+terraform output
+```
+
+Note the values for `sqs_queue_url` and `sns_topic_arn`.
+
+Then on EC2:
+
+```bash
+# Create directory
 sudo mkdir -p /opt/hello-events
-sudo tee /opt/hello-events/.env >/dev/null <<'EOF'
+sudo chown ec2-user:ec2-user /opt/hello-events
+
+# Create .env file (replace placeholders with terraform outputs)
+cat > /opt/hello-events/.env <<'EOF'
 AWS_REGION=us-east-1
 DYNAMODB_TABLE_NAME=hello-events
-SNS_TOPIC_ARN=<terraform-output-sns-topic-arn>
-SQS_QUEUE_URL=<terraform-output-sqs-queue-url>
-KAFKA_BROKERS=<your-runtime-kafka-broker>
+SNS_TOPIC_ARN=arn:aws:sns:us-east-1:831622639485:hello-events-created
+SQS_QUEUE_URL=https://sqs.us-east-1.amazonaws.com/831622639485/hello-events-created-queue
+KAFKA_BROKERS=localhost:19092
 KAFKA_CLIENT_ID=hello-events-app
 KAFKA_TOPIC=hello-events
 PORT=3000
 EOF
+
+cat /opt/hello-events/.env  # verify content
 ```
+
+#### 14.4.5 Verify ECR authentication
+
+EC2's IAM role should provide credentials automatically:
+
+```bash
+aws ecr get-authorization-token --region us-east-1
+```
+
+If successful, you'll see a token. If it fails, check:
+- Instance profile is attached to EC2 instance
+- Role has ECR permissions
+- Instance can access AWS metadata service
+
+**Readiness checklist:**
+- [ ] EC2 instance running and public IP accessible
+- [ ] Can SSH in: `ssh -i key.pem ec2-user@<IP>`
+- [ ] `docker ps` returns empty list (Docker running)
+- [ ] `aws --version` works
+- [ ] `/opt/hello-events/.env` exists with correct terraform values
+- [ ] `aws ecr get-authorization-token` returns a token (no error)
+
+#### 14.4.6 Create ECR repository
+
+Open AWS Console in us-east-1:
+1. Go to ECR → Repositories → Create repository
+2. Visibility: Private
+3. Repository name: `hello-events-api`
+4. Keep defaults for the rest
+5. Click Create repository
 
 ### 14.5 Configure GitHub repository secrets and variables
 
