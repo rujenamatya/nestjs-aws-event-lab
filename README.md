@@ -153,6 +153,81 @@ Why IaC:
 - Version-controlled infrastructure
 - Safer changes through plan/apply workflow
 
+### 9.0 Bootstrap remote state (first time only)
+
+Terraform stores a state file that tracks what it has provisioned. Without a remote backend, each GitHub Actions run starts with an empty state and tries to recreate resources that already exist, causing `EntityAlreadyExists` errors.
+
+The state backend uses an S3 bucket (storage) and a DynamoDB table (locking). These must exist before running `terraform init`, and they are created manually — not by Terraform itself — to avoid a bootstrapping circular dependency.
+
+**Create the S3 bucket:**
+
+```bash
+aws s3api create-bucket \
+  --bucket hello-events-tfstate-831622639485 \
+  --region us-east-1
+
+aws s3api put-bucket-versioning \
+  --bucket hello-events-tfstate-831622639485 \
+  --versioning-configuration Status=Enabled
+
+aws s3api put-bucket-encryption \
+  --bucket hello-events-tfstate-831622639485 \
+  --server-side-encryption-configuration '{"Rules":[{"ApplyServerSideEncryptionByDefault":{"SSEAlgorithm":"AES256"}}]}'
+```
+
+**Create the DynamoDB lock table:**
+
+```bash
+aws dynamodb create-table \
+  --table-name hello-events-tfstate-lock \
+  --attribute-definitions AttributeName=LockID,AttributeType=S \
+  --key-schema AttributeName=LockID,KeyType=HASH \
+  --billing-mode PAY_PER_REQUEST \
+  --region us-east-1
+```
+
+**Add S3 and DynamoDB state permissions to the GitHub Actions role:**
+
+The `github-actions-nestjs-aws-lab` role needs additional permissions to read and write the state backend. Add these statements to the inline policy:
+
+```json
+{
+  "Sid": "TerraformStateS3",
+  "Effect": "Allow",
+  "Action": [
+    "s3:GetObject",
+    "s3:PutObject",
+    "s3:DeleteObject",
+    "s3:ListBucket"
+  ],
+  "Resource": [
+    "arn:aws:s3:::hello-events-tfstate-831622639485",
+    "arn:aws:s3:::hello-events-tfstate-831622639485/*"
+  ]
+},
+{
+  "Sid": "TerraformStateLock",
+  "Effect": "Allow",
+  "Action": [
+    "dynamodb:GetItem",
+    "dynamodb:PutItem",
+    "dynamodb:DeleteItem"
+  ],
+  "Resource": "arn:aws:dynamodb:us-east-1:831622639485:table/hello-events-tfstate-lock"
+}
+```
+
+**If you already ran `terraform apply` with local state, migrate it:**
+
+```bash
+cd terraform
+terraform init  # detects the new backend and prompts to migrate
+```
+
+Terraform will ask: `Do you want to copy existing state to the new backend?` — answer yes.
+
+### 9.1 Provision resources
+
 Commands:
 
 ```bash
