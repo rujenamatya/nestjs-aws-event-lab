@@ -63,8 +63,76 @@ jobs:
           envs: AWS_REGION,ECR_REGISTRY,ECR_REPOSITORY,IMAGE_TAG
           script_stop: true
           script: |
+            set -euo pipefail
+
+            IMAGE="$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
+
+            # Login + pull latest app image
             aws ecr get-login-password --region "$AWS_REGION" | docker login --username AWS --password-stdin "$ECR_REGISTRY"
-            docker pull "$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
+            docker pull "$IMAGE"
+
+            # Shared network for app stack
+            docker network create hello-events-net || true
+
+            # Start Kafka broker (Redpanda)
+            docker rm -f redpanda || true
+            docker run -d \
+              --name redpanda \
+              --restart unless-stopped \
+              --network hello-events-net \
+              -p 19092:19092 \
+              docker.redpanda.com/redpandadata/redpanda:v24.1.10 \
+              redpanda start \
+                --overprovisioned \
+                --smp 1 \
+                --memory 1G \
+                --reserve-memory 0M \
+                --node-id 0 \
+                --check=false \
+                --kafka-addr PLAINTEXT://0.0.0.0:9092,OUTSIDE://0.0.0.0:19092 \
+                --advertise-kafka-addr PLAINTEXT://redpanda:9092,OUTSIDE://127.0.0.1:19092
+
+            # Wait until Redpanda is ready (max 60s)
+            attempts=0
+            until docker exec redpanda rpk cluster info >/dev/null 2>&1; do
+              attempts=$((attempts + 1))
+              if [ "$attempts" -ge 30 ]; then
+                echo "Redpanda did not become ready in time"
+                docker logs --tail 50 redpanda
+                exit 1
+              fi
+              echo "Waiting for Redpanda... ($attempts/30)"
+              sleep 2
+            done
+
+            # API container
             docker stop hello-events-api || true
             docker rm hello-events-api || true
-            docker run -d --name hello-events-api --restart unless-stopped -p 3000:3000 --env-file /opt/hello-events/.env "$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
+            docker run -d \
+              --name hello-events-api \
+              --restart unless-stopped \
+              --network hello-events-net \
+              -p 3000:3000 \
+              --env-file /opt/hello-events/.env \
+              -e KAFKA_BROKERS=redpanda:9092 \
+              "$IMAGE"
+
+            # Worker container
+            docker stop hello-events-worker || true
+            docker rm hello-events-worker || true
+            docker run -d \
+              --name hello-events-worker \
+              --restart unless-stopped \
+              --network hello-events-net \
+              --env-file /opt/hello-events/.env \
+              -e KAFKA_BROKERS=redpanda:9092 \
+              "$IMAGE" \
+              node dist/worker/main.js
+
+            # Give containers a moment to produce startup logs
+            sleep 5
+            docker ps
+            echo "--- API logs ---"
+            docker logs --tail 30 hello-events-api || true
+            echo "--- Worker logs ---"
+            docker logs --tail 30 hello-events-worker || true
